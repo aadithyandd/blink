@@ -1,4 +1,4 @@
-// 1. Firebase Initialization
+// 1. Firebase Configuration & Initialization
 const firebaseConfig = {
   apiKey: "AIzaSyB8-vuazeaFxNsaRvXmrBx6LfvlJ8atyoY",
   authDomain: "blink1-useless.firebaseapp.com",
@@ -12,17 +12,23 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
 
-// State variables
+// 2. State Variables
 let myPlayerId = null;
 let roomCode = null;
 let myName = "Player";
 let myMeter = 0; // 0 to 100
-let decayRate = 2.0; // Decay speed per tick
-let isBlinking = false;
+let decayRate = 2.0; // Decay step per tick
 let gameStatus = "waiting"; // "waiting", "countdown", "playing", "ended"
 let decayInterval = null;
 
-// DOM references
+// 3. High-Precision Blink Engine Variables
+let blinkFrameCounter = 0;
+const MIN_CLOSED_FRAMES = 2;   // Eye must stay closed >= 2 frames (eliminates 1-frame motion blur glitches)
+const BLINK_THRESHOLD = 0.19;    // Must drop below this to count as closed
+const REOPEN_THRESHOLD = 0.25;   // Must reopen above this before another blink can register
+let eyeIsClosedState = false;
+
+// 4. DOM References
 const lobbyScreen = document.getElementById("lobby-screen");
 const gameScreen = document.getElementById("game-screen");
 const p1Bar = document.getElementById("p1-bar");
@@ -39,7 +45,7 @@ const statusBadge = document.getElementById("game-status");
 const videoElement = document.getElementById("webcam");
 const leaderboardList = document.getElementById("leaderboard-list");
 
-// Load Leaderboard on boot
+// Load Global Leaderboard on boot
 loadGlobalLeaderboard();
 
 function loadGlobalLeaderboard() {
@@ -64,7 +70,7 @@ function loadGlobalLeaderboard() {
   });
 }
 
-// Handle Room Join / Create
+// 5. Room Setup & Lifecycle
 document.getElementById("join-btn").addEventListener("click", async () => {
   myName = document.getElementById("player-name").value.trim() || "Player";
   roomCode = document.getElementById("room-id").value.trim();
@@ -88,13 +94,19 @@ document.getElementById("join-btn").addEventListener("click", async () => {
         p1: { name: myName, meter: 0 }
       }
     });
+    // Auto-delete entire room if host closes tab while waiting alone
     roomRef.onDisconnect().remove();
   } else if (!roomData.players || !roomData.players.p2) {
-    // Player 2 joins
+    // Player 2 joins room
     myPlayerId = "p2";
     decayRate = roomData.decay;
+    
+    // Cancel the room-wide wipe on disconnect now that 2 people are here
     roomRef.onDisconnect().cancel();
+    
     await roomRef.child("players/p2").set({ name: myName, meter: 0 });
+    
+    // Clear individual players if they leave
     roomRef.child("players/p2").onDisconnect().remove();
     roomRef.child("players/p1").onDisconnect().remove();
   } else {
@@ -109,7 +121,7 @@ document.getElementById("join-btn").addEventListener("click", async () => {
   startWebcamAndDetection();
 });
 
-// Sync Room State
+// 6. Real-time Firebase Sync
 function listenToRoom() {
   const roomRef = db.ref(`rooms/${roomCode}`);
 
@@ -117,52 +129,54 @@ function listenToRoom() {
     const data = snapshot.val();
     if (!data || !data.players) {
       if (gameStatus !== "ended") {
-        alert("Opponent left or room closed.");
+        alert("Opponent disconnected or room was removed.");
         location.reload();
       }
       return;
     }
 
-    // Render Meters & Names
+    // Update Player 1 progress
     if (data.players.p1) {
       p1Label.innerText = data.players.p1.name;
       p1Pct.innerText = `${Math.round(data.players.p1.meter)}%`;
       p1Bar.style.width = `${data.players.p1.meter}%`;
     }
+
+    // Update Player 2 progress
     if (data.players.p2) {
       p2Label.innerText = data.players.p2.name;
       p2Pct.innerText = `${Math.round(data.players.p2.meter)}%`;
       p2Bar.style.width = `${data.players.p2.meter}%`;
     }
 
-    // Host controls the Start Button visibility
+    // Host controls the Start Match button
     if (myPlayerId === "p1" && data.players.p2 && data.state === "waiting") {
       startBtn.classList.remove("hidden");
       statusBadge.innerText = "Ready to start!";
     }
 
-    // Countdown State Sync
+    // Handle Countdown State
     if (data.state === "countdown" && gameStatus !== "countdown") {
       gameStatus = "countdown";
       startBtn.classList.add("hidden");
       runCountdownUI();
     }
 
-    // Playing State Sync
+    // Handle Playing State
     if (data.state === "playing" && gameStatus !== "playing") {
       gameStatus = "playing";
       statusBadge.innerText = "BLINK FAST!";
       startDecayEngine();
     }
 
-    // Winner detected
+    // Handle Game Over
     if (data.winner && gameStatus !== "ended") {
       handleGameOver(data.winner);
     }
   });
 }
 
-// Host triggers the game start sequence
+// 7. Start Sequence & Countdown
 startBtn.addEventListener("click", () => {
   db.ref(`rooms/${roomCode}`).update({ state: "countdown" });
 });
@@ -188,7 +202,7 @@ function runCountdownUI() {
   }, 1000);
 }
 
-// Continuous Meter Drain
+// 8. Tug-Of-War Decay Engine
 function startDecayEngine() {
   if (decayInterval) clearInterval(decayInterval);
 
@@ -205,34 +219,82 @@ function startDecayEngine() {
   }, 100);
 }
 
-// Handle Blink Detection via MediaPipe
-function calculateEAR(top, bottom, left, right) {
-  const vertical = Math.hypot(top.x - bottom.x, top.y - bottom.y);
-  const horizontal = Math.hypot(left.x - right.x, left.y - right.y);
-  return vertical / horizontal;
+// 9. Extra-Accurate Dual-Point Eye Aspect Ratio (EAR) Math
+function dist(p1, p2) {
+  return Math.hypot(p1.x - p2.x, p1.y - p2.y);
 }
 
+function getAccurateEAR(eye, lm) {
+  const p1 = lm[eye.left];
+  const p4 = lm[eye.right];
+  const p2 = lm[eye.top1];
+  const p6 = lm[eye.bottom1];
+  const p3 = lm[eye.top2];
+  const p5 = lm[eye.bottom2];
+
+  const vertical1 = dist(p2, p6);
+  const vertical2 = dist(p3, p5);
+  const horizontal = dist(p1, p4);
+
+  if (horizontal === 0) return 0;
+  return (vertical1 + vertical2) / (2.0 * horizontal);
+}
+
+// Rejects frame if head or phone is tilted/shaken horizontally
+function isHeadFacingCamera(lm) {
+  const nose = lm[1].x;
+  const leftCheek = lm[234].x;
+  const rightCheek = lm[454].x;
+
+  const distToLeft = Math.abs(nose - leftCheek);
+  const distToRight = Math.abs(nose - rightCheek);
+  const ratio = distToLeft / (distToRight + 0.0001);
+
+  return ratio > 0.45 && ratio < 2.2;
+}
+
+// 10. Frame-by-Frame MediaPipe Callback
 function onResults(results) {
-  if (gameStatus !== "playing" || !results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) return;
+  if (gameStatus !== "playing" || !results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+    blinkAlert.style.display = "none";
+    return;
+  }
 
-  const landmarks = results.multiFaceLandmarks[0];
-  const leftEAR = calculateEAR(landmarks[159], landmarks[145], landmarks[33], landmarks[133]);
-  const rightEAR = calculateEAR(landmarks[386], landmarks[374], landmarks[362], landmarks[263]);
-  const avgEAR = (leftEAR + rightEAR) / 2;
+  const lm = results.multiFaceLandmarks[0];
 
-  if (avgEAR < 0.21) {
-    if (!isBlinking) {
-      isBlinking = true;
+  // Discard frame if phone or head is shaking horizontally
+  if (!isHeadFacingCamera(lm)) {
+    blinkFrameCounter = 0;
+    return;
+  }
+
+  // 6-point eye landmark configuration
+  const leftEyeData = { left: 33, right: 133, top1: 160, bottom1: 144, top2: 158, bottom2: 153 };
+  const rightEyeData = { left: 362, right: 263, top1: 385, bottom1: 380, top2: 387, bottom2: 373 };
+
+  const leftEAR = getAccurateEAR(leftEyeData, lm);
+  const rightEAR = getAccurateEAR(rightEyeData, lm);
+  const ear = (leftEAR + rightEAR) / 2.0;
+
+  // Frame debounced state machine
+  if (ear < BLINK_THRESHOLD) {
+    blinkFrameCounter++;
+    
+    // Only fire when eyes stay closed across consecutive frames
+    if (blinkFrameCounter >= MIN_CLOSED_FRAMES && !eyeIsClosedState) {
+      eyeIsClosedState = true;
       pushMeterUp();
       blinkAlert.style.display = "block";
     }
-  } else {
-    isBlinking = false;
+  } else if (ear > REOPEN_THRESHOLD) {
+    // Fully reset only after eyes open back up completely
+    blinkFrameCounter = 0;
+    eyeIsClosedState = false;
     blinkAlert.style.display = "none";
   }
 }
 
-// Each blink adds +7% to your meter
+// 11. Point Increment & Win Trigger
 function pushMeterUp() {
   myMeter = Math.min(100, myMeter + 7.5);
   db.ref(`rooms/${roomCode}/players/${myPlayerId}/meter`).set(myMeter);
@@ -245,7 +307,7 @@ function pushMeterUp() {
   }
 }
 
-// Game Over & Global Leaderboard Write
+// 12. Match Conclusion & Leaderboard Write
 async function handleGameOver(winnerName) {
   gameStatus = "ended";
   if (decayInterval) clearInterval(decayInterval);
@@ -254,7 +316,7 @@ async function handleGameOver(winnerName) {
   winnerBanner.innerText = `🏆 ${winnerName} Wins!`;
   winnerBanner.classList.remove("hidden");
 
-  // Only the winning client writes their win to avoid double counts
+  // Only winner performs the increment to prevent duplicate writes
   if (winnerName === myName) {
     const leaderRef = db.ref(`leaderboard/${myName}/wins`);
     await leaderRef.transaction((currentWins) => (currentWins || 0) + 1);
@@ -266,7 +328,7 @@ async function handleGameOver(winnerName) {
   }, 8000);
 }
 
-// Start Front-facing Webcam
+// 13. Mobile Front-Camera Initialization
 function startWebcamAndDetection() {
   const faceMesh = new FaceMesh({
     locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
@@ -274,7 +336,7 @@ function startWebcamAndDetection() {
 
   faceMesh.setOptions({
     maxNumFaces: 1,
-    refineLandmarks: false,
+    refineLandmarks: false, // Disables iris tracking for fast mobile performance
     minDetectionConfidence: 0.5,
     minTrackingConfidence: 0.5
   });
